@@ -469,7 +469,14 @@ def main() -> int:
         Path(churro_root, "churro", "repo_index.py").is_file()
         if churro_root.exists() else False
     )
+    structure_enabled = False
+    if overview_enabled and args.workspace.exists():
+        structure_enabled = any(
+            p.is_file() and p.name == "__init__.py"
+            for p in args.workspace.rglob("__init__.py")
+        )
     detailed["overview_enabled"] = overview_enabled
+    detailed["structure_enabled"] = structure_enabled
     detailed["condition"] = args.condition
     meta["detailed"] = detailed
 
@@ -496,6 +503,7 @@ def main() -> int:
     print(f"condition        : {args.condition or '(none)'}")
     print(f"churro root      : {churro_root}")
     print(f"overview enabled : {overview_enabled}")
+    print(f"structure enabled: {structure_enabled}")
     print(f"run dir          : {run_dir}")
     print(f"agent wall time  : {meta.get('elapsed_seconds', 'n/a')}s")
     print(f"pre-check        : 9 passed / 3 failed -> OK={pre_ok}")

@@ -189,17 +189,24 @@ class CHURROApp:
         return messages
 
     def _build_system_content(self) -> str:
-        from churro.repo_index import build_summary
-
-        return "\n\n".join(
-            [
-                self.system_prompt,
-                "REPOSITORY OVERVIEW",
-                build_summary(PROJECT_ROOT),
-                "CURRENT PROJECT STATE",
-                format_state(self.session.state),
-            ]
+        from churro.repo_index import (
+            build_index,
+            build_structure,
+            format_structure,
+            format_summary,
         )
+
+        index = build_index(PROJECT_ROOT)
+        sections = [
+            self.system_prompt,
+            "REPOSITORY OVERVIEW",
+            format_summary(index),
+        ]
+        structure = format_structure(build_structure(PROJECT_ROOT, index))
+        if structure:
+            sections.extend(["REPOSITORY STRUCTURE", structure])
+        sections.extend(["CURRENT PROJECT STATE", format_state(self.session.state)])
+        return "\n\n".join(sections)
 
     # -------------------------------------------------------------- commands
     def _process_command(self, text: str) -> bool:

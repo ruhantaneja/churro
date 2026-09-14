@@ -5,10 +5,17 @@ The index is built purely from directory traversal and file-name metadata
 The summary it renders is injected into the system prompt so the agent
 starts with a compact map of the project instead of spending iterations on
 exploration. Detailed investigation still goes through the filesystem tools.
+
+Step 21 adds a shallow, module-level structural layer: Python packages,
+entry points, top-level symbols, imports, and local import relationships.
+This layer reads only the Python source/test files the index already
+classified, runs conservative regex analysis (no execution, no AST, no
+importlib), and never leaves the workspace.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -285,3 +292,290 @@ def format_summary(index: RepoIndex) -> str:
 def build_summary(root: Path) -> str:
     """Convenience: return ``format_summary(build_index(root))``."""
     return format_summary(build_index(root))
+
+
+# ---------------------------------------------------------------------------
+# Step 21: repository structure intelligence
+#
+# Extends Step 20 from "what files exist" to "what are the important parts
+# and how are they related". All analysis is deterministic and content is
+# read only for the Python source/test files the index already classified.
+# ---------------------------------------------------------------------------
+
+# Hard cap on rendered structure lines (safety valve for large workspaces).
+_STRUCTURE_MAX_LINES = 60
+# Cap on how many "most imported" modules are shown.
+_MOST_IMPORTED_MAX = 8
+# Cap on how many symbols / local imports a single module line lists.
+_MAX_INLINE_ITEMS = 8
+
+_FROM_IMPORT_RE = re.compile(r"^from\s+([\w.]+)\s+import\b")
+_IMPORT_RE = re.compile(r"^import\s+(.+)")
+_IMPORT_NAME_RE = re.compile(r"^([\w.]+)")
+_CLASS_RE = re.compile(r"^class\s+(\w+)", re.MULTILINE)
+_FUNCTION_RE = re.compile(r"^(?:async\s+)?def\s+(\w+)", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class ModuleInfo:
+    """Structural summary of one analyzed Python module.
+
+    ``path`` is workspace-relative with forward slashes. ``imports`` are the
+    dotted module names exactly as written (deduplicated, sorted);
+    ``imports_local`` are the workspace-relative paths of the imports that
+    resolve to files in the repository index. ``classes`` and ``functions``
+    are top-level only (nested symbols are intentionally excluded).
+    """
+
+    path: str
+    lines: int
+    classes: tuple[str, ...]
+    functions: tuple[str, ...]
+    imports: tuple[str, ...]
+    imports_local: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RepoStructure:
+    """Deterministic, module-level map of a Python workspace.
+
+    ``packages`` are the workspace-relative directories that contain an
+    ``__init__.py`` (the root package is ``"."``). ``entry_points`` are the
+    ``__main__.py`` workspace-relative paths. ``modules`` holds every local
+    Python source/test file that could be read and analyzed, sorted by path.
+    ``imported_by`` maps each local Python module path to the (sorted) paths
+    of modules that import it — the centrality view.
+    """
+
+    packages: tuple[str, ...]
+    entry_points: tuple[str, ...]
+    modules: tuple[ModuleInfo, ...]
+    imported_by: dict[str, tuple[str, ...]]
+
+
+def _read_python_file(path: Path) -> str | None:
+    """Read a Python file as UTF-8, or ``None`` if it cannot be decoded."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
+def _count_lines(content: str) -> int:
+    """Count the newline-separated lines in ``content``."""
+    return len(content.splitlines())
+
+
+def _extract_imports(content: str) -> tuple[str, ...]:
+    """Extract dotted import names conservatively (regex, no execution).
+
+    Handles ``import x``, ``import x, y as z``, ``from x import y``, and the
+    common multiline ``from x import (`` opening line. Names are deduplicated
+    and returned sorted.
+    """
+    names: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        from_match = _FROM_IMPORT_RE.match(stripped)
+        if from_match is not None:
+            names.append(from_match.group(1))
+            continue
+        import_match = _IMPORT_RE.match(stripped)
+        if import_match is None:
+            continue
+        tail = import_match.group(1).strip()
+        if tail.startswith("("):
+            continue
+        for piece in tail.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            name_match = _IMPORT_NAME_RE.match(piece)
+            if name_match is not None:
+                names.append(name_match.group(1))
+    seen: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.append(name)
+    return tuple(sorted(seen))
+
+
+def _extract_symbols(content: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return ``(classes, functions)`` declared at column zero only.
+
+    Because the patterns anchor at the start of a line without any leading
+    indentation, nested classes and functions are never reported.
+    """
+    classes = tuple(cls for cls in _CLASS_RE.findall(content))
+    functions = tuple(fn for fn in _FUNCTION_RE.findall(content))
+    return classes, functions
+
+
+def _resolve_import_to_path(module_name: str, known: frozenset[str]) -> str | None:
+    """Resolve a dotted import name to an existing workspace-relative path.
+
+    Tries ``<module>.py`` first, then ``<pkg>/__init__.py``. Returns ``None``
+    when the import does not name a file in the repository index (stdlib,
+    third-party, or unknown), so external imports are never mapped locally.
+    """
+    if not module_name:
+        return None
+    dotted = module_name
+    module_candidate = dotted.replace(".", "/") + ".py"
+    if module_candidate in known:
+        return module_candidate
+    package_candidate = dotted.replace(".", "/") + "/__init__.py"
+    if package_candidate in known:
+        return package_candidate
+    return None
+
+
+def build_structure(root: Path, index: RepoIndex | None = None) -> RepoStructure:
+    """Build module-level structural intelligence for ``root``.
+
+    Derives everything from the existing ``RepoIndex`` (built once here when
+    none is supplied) so the workspace is walked at most once. Only the
+    Python source/test files already classified by the index are read, and
+    only their line counts, top-level symbols, and import statements are
+    extracted via deterministic regexes. Nothing is executed or imported; no
+    network calls and no filesystem writes occur.
+    """
+    root = Path(root)
+    if index is None:
+        index = build_index(root)
+
+    source = list(index.source_files)
+    test = list(index.test_files)
+    py_files = sorted(rel for rel in source + test if rel.endswith(".py"))
+    known = frozenset(py_files)
+
+    all_indexed = source + test
+    packages: list[str] = []
+    entry_points: list[str] = []
+    for rel in all_indexed:
+        if rel.endswith("__init__.py"):
+            parent = rel[: -len("__init__.py")].rstrip("/")
+            packages.append(parent or ".")
+        if rel.endswith("__main__.py"):
+            entry_points.append(rel)
+
+    modules: list[ModuleInfo] = []
+    importers: dict[str, set[str]] = {rel: set() for rel in py_files}
+
+    for rel in py_files:
+        content = _read_python_file(root / rel)
+        if content is None:
+            continue
+        classes, functions = _extract_symbols(content)
+        imports = _extract_imports(content)
+        local_imports = tuple(
+            sorted(
+                resolved
+                for name in imports
+                if (resolved := _resolve_import_to_path(name, known)) is not None
+            )
+        )
+        modules.append(
+            ModuleInfo(
+                path=rel,
+                lines=_count_lines(content),
+                classes=classes,
+                functions=functions,
+                imports=imports,
+                imports_local=local_imports,
+            )
+        )
+        for target in local_imports:
+            importers[target].add(rel)
+
+    imported_by = {rel: tuple(sorted(importers[rel])) for rel in sorted(importers)}
+
+    return RepoStructure(
+        packages=tuple(sorted(packages)),
+        entry_points=tuple(entry_points),
+        modules=tuple(modules),
+        imported_by=imported_by,
+    )
+
+
+def _render_inline(names: tuple[str, ...], cap: int = _MAX_INLINE_ITEMS) -> str:
+    """Render ``names`` compactly, capping long lists to keep lines short."""
+    shown = ", ".join(names[:cap])
+    extra = len(names) - cap
+    if extra > 0:
+        return f"{shown} ... +{extra} more"
+    return shown
+
+
+def _render_module_line(module: ModuleInfo) -> str:
+    detail = f"  {module.path}: {module.lines} lines"
+    if module.classes:
+        detail += f"; classes: {_render_inline(module.classes)}"
+    if module.functions:
+        detail += f"; functions: {_render_inline(module.functions)}"
+    if module.imports_local:
+        detail += f"; local: {_render_inline(module.imports_local)}"
+    return detail
+
+
+def format_structure(structure: RepoStructure) -> str:
+    """Render structural intelligence as a compact prompt block.
+
+    Capped at ``_STRUCTURE_MAX_LINES`` lines with a truncation marker. Paths
+    are always workspace-relative. Returns an empty string when the
+    workspace has no meaningful Python package hierarchy, so Step 20's
+    overview remains the fallback.
+    """
+    if not structure.packages or not structure.modules:
+        return ""
+
+    lines: list[str] = []
+
+    lines.append("Packages:")
+    for package in structure.packages:
+        lines.append(f"  {package}/" if package != "." else "  .")
+
+    if structure.entry_points:
+        lines.append("")
+        lines.append("Entry points:")
+        lines.extend(f"  {entry}" for entry in structure.entry_points)
+
+    ranked = sorted(
+        (
+            (rel, importers)
+            for rel, importers in structure.imported_by.items()
+            if importers
+        ),
+        key=lambda item: (-len(item[1]), item[0]),
+    )
+    if ranked:
+        lines.append("")
+        lines.append("Most-imported (structurally central):")
+        for rel, importers in ranked[:_MOST_IMPORTED_MAX]:
+            label = "file" if len(importers) == 1 else "files"
+            lines.append(f"  {rel}: imported by {len(importers)} {label}")
+
+    lines.append("")
+    lines.append("Modules:")
+    for module in structure.modules:
+        lines.append(_render_module_line(module))
+
+    if len(lines) > _STRUCTURE_MAX_LINES:
+        lines = lines[: _STRUCTURE_MAX_LINES - 1] + ["... structure truncated"]
+    return "\n".join(lines)
+
+
+def build_full_summary(root: Path) -> str:
+    """Convenience: Step 20 overview plus Step 21 structure, joined.
+
+    Walks the workspace once and returns ``format_summary`` followed by
+    ``format_structure`` (when non-empty), separated by a blank line.
+    """
+    index = build_index(root)
+    summary = format_summary(index)
+    structure = format_structure(build_structure(root, index))
+    if structure:
+        return f"{summary}\n\n{structure}"
+    return summary
