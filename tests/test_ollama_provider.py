@@ -580,6 +580,31 @@ def test_client_provider_error_passes_through_unwrapped():
             raise AssertionError("expected APIRequestError")
 
 
+def test_keyboard_interrupt_propagates_unwrapped():
+    """Step 18.9: KeyboardInterrupt must not be wrapped in APIRequestError.
+
+    Ctrl+C during a long Ollama generation should surface as
+    KeyboardInterrupt so ``_command_agent`` can display the correct
+    "interrupted by Ctrl+C" message instead of swallowing it.
+    """
+    with env_as():
+
+        def raising(url, payload, timeout):
+            raise KeyboardInterrupt("aborted")
+
+        provider = OllamaProvider(model="llama3", client=raising)
+        try:
+            provider.send_normalized([{"role": "user", "content": "hi"}])
+        except KeyboardInterrupt as exc:
+            assert "aborted" in str(exc)
+        except APIRequestError:
+            raise AssertionError(
+                "KeyboardInterrupt should propagate, not be wrapped in APIRequestError"
+            )
+        else:
+            raise AssertionError("expected KeyboardInterrupt")
+
+
 # ------------------------------------------------------ agent integration
 def test_agent_runner_ollama_full_tool_round():
     with env_as():
@@ -664,6 +689,7 @@ TEST_FUNCTIONS = [
     test_non_json_body_maps_to_unexpected_response_error,
     test_client_plain_exception_wrapped_in_api_request_error,
     test_client_provider_error_passes_through_unwrapped,
+    test_keyboard_interrupt_propagates_unwrapped,
     test_agent_runner_ollama_full_tool_round,
 ]
 

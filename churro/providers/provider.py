@@ -24,6 +24,10 @@ class MissingAPIKeyError(ProviderError):
     """No API key was configured for the provider."""
 
 
+class ProviderSpecError(ProviderError):
+    """A provider specification could not be parsed or resolved."""
+
+
 class AuthenticationError(ProviderError):
     """The provider rejected the supplied credentials."""
 

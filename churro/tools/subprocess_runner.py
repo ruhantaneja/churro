@@ -59,6 +59,8 @@ def run_captured(
         return CapturedResult(
             error=f"Failed to launch command: {type(exc).__name__}: {exc}"
         )
+    except KeyboardInterrupt:
+        raise
     except Exception as exc:
         return CapturedResult(
             error=f"Unexpected error launching command: {type(exc).__name__}: {exc}"
@@ -73,6 +75,9 @@ def run_captured(
             stderr=getattr(exc, "stderr", None) or "",
             timed_out=True,
         )
+    except KeyboardInterrupt:
+        terminate_tree(proc)
+        raise
     except Exception as exc:
         terminate_tree(proc)
         return CapturedResult(

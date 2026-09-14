@@ -7,6 +7,7 @@ from churro.core.validator import validate_state_update
 
 _ACCUMULATING_LISTS = frozenset({"completed_work"})
 _REPLACING_LISTS = frozenset({"blockers", "relevant_files"})
+_PRESERVED_FIELDS = frozenset({"goal"})
 
 
 @dataclass
@@ -22,10 +23,14 @@ def _merge_state(state: SessionState, valid: dict[str, Any]) -> dict[str, Any]:
     """Merge only pre-validated fields into the session state.
 
     This is the single place SessionState may be mutated by an AI response.
+    Fields in ``_PRESERVED_FIELDS`` (currently the session goal) are never
+    merged; they are acknowledged but left untouched.
     """
     merged: dict[str, Any] = {}
 
     for key, value in valid.items():
+        if key in _PRESERVED_FIELDS:
+            continue
         if key in _ACCUMULATING_LISTS:
             combined = list(state.completed_work)
             for item in value:
@@ -60,6 +65,12 @@ def process_ai_response(session: Session, raw_response: str) -> ProcessResult:
         result.rejected_fields = dict(validated.invalid)
         result.warnings.extend(validated.warnings)
         if validated.valid:
+            preserved = [key for key in validated.valid if key in _PRESERVED_FIELDS]
+            if preserved:
+                result.warnings.append(
+                    "Field(s) are protected and were not updated: "
+                    + ", ".join(sorted(preserved))
+                )
             result.merged_fields = _merge_state(session.state, validated.valid)
 
     session.conversation_history.append(

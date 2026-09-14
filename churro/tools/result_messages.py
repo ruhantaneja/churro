@@ -18,18 +18,43 @@ from churro.tools.tool import ToolResult
 
 _SUCCESS_FALLBACK = "(tool returned no output)"
 _FAILURE_FALLBACK = "(tool failed with no error details)"
+_FAILURE_OUTPUT_LIMIT_CHARS = 20_000
+
+
+def _cap_failure_output(text: str) -> str:
+    """Cap failure detail output using the shared truncation convention."""
+    if text and len(text) > _FAILURE_OUTPUT_LIMIT_CHARS:
+        return (
+            text[: _FAILURE_OUTPUT_LIMIT_CHARS]
+            + f"\n... [output truncated at {_FAILURE_OUTPUT_LIMIT_CHARS} characters]"
+        )
+    return text
 
 
 def result_content(result: ToolResult) -> str:
     """Return the useful content for a ToolResult.
 
-    Successful results expose their output; failed results expose their
-    error. An empty string is replaced with a fixed placeholder so the
-    content is always deterministic and never silently blank.
+    Successful results expose their output. Failed results expose their
+    error and, when present, the captured output that explains what went
+    wrong -- error summary first, details second. Empty strings are
+    replaced with a fixed placeholder so the content is always
+    deterministic and never silently blank.
     """
     if result.success:
         return result.output or _SUCCESS_FALLBACK
-    return result.error or _FAILURE_FALLBACK
+
+    error = result.error.strip()
+    output = result.output.strip()
+    if output == error:
+        output = ""
+
+    if error and output:
+        return f"{error}\n\n{_cap_failure_output(output)}"
+    if error:
+        return error
+    if output:
+        return _cap_failure_output(output)
+    return _FAILURE_FALLBACK
 
 
 def result_message_from_execution(execution: ToolExecutionResult) -> ToolResultMessage:

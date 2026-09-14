@@ -267,6 +267,43 @@ def test_describes_arbitrary_command_execution():
     assert "trust" in tool.description.lower()
 
 
+def test_keyboard_interrupt_reraises_from_run_captured():
+    """Step 18.9: Ctrl+C while a tool subprocess runs must propagate.
+
+    ``run_captured`` must re-raise KeyboardInterrupt instead of capturing
+    it as a generic subprocess error, so the CLI can abort the agent.
+    """
+    import subprocess
+
+    from churro.tools.subprocess_runner import run_captured
+
+    interrupted = KeyboardInterrupt("interrupted")
+
+    class FakeProc:
+        pid = 999999999
+
+        def communicate(self, timeout):
+            raise interrupted
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=5):
+            return 0
+
+    original_open = subprocess.Popen
+    subprocess.Popen = lambda *args, **kwargs: FakeProc()
+    try:
+        try:
+            run_captured([sys.executable, "-c", "pass"], make_root(), 30)
+        except KeyboardInterrupt as exc:
+            assert exc is interrupted
+        else:
+            raise AssertionError("expected KeyboardInterrupt to propagate")
+    finally:
+        subprocess.Popen = original_open
+
+
 TEST_FUNCTIONS = [
     test_successful_command,
     test_captured_stdout,
@@ -293,6 +330,7 @@ TEST_FUNCTIONS = [
     test_cannot_select_arbitrary_cwd,
     test_workspace_path_with_spaces,
     test_describes_arbitrary_command_execution,
+    test_keyboard_interrupt_reraises_from_run_captured,
 ]
 
 

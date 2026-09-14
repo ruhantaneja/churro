@@ -7,14 +7,23 @@ from pathlib import Path
 from rich.console import Console
 
 from churro.core.session import ConversationMessage, create_session, load_session
-from churro.main import CHURROApp, _start_new_session, main as run_churro_main
+from churro.main import (
+    CHURROApp,
+    PROJECT_ROOT,
+    SESSIONS_DIR,
+    _start_new_session,
+    _workspace_root_from_env,
+    main as run_churro_main,
+)
+from churro.tools import default_tool_registry
 from churro.providers.provider import APIRequestError, Provider
 
 
 class FakeProvider(Provider):
     name = "openai"
 
-    def __init__(self, model="gpt-4o", responses=()):
+    def __init__(self, model="gpt-4o", responses=(), name=None):
+        self.name = name or self.name
         self.model = model
         self.responses = list(responses)
         self.sent_messages = []
@@ -257,7 +266,11 @@ def test_unknown_command():
 
 def test_main_graceful_without_api_key():
     saved = os.environ.get("OPENAI_API_KEY")
+    saved_provider = os.environ.get("CHURRO_PROVIDER")
+    saved_model = os.environ.get("CHURRO_MODEL")
     os.environ.pop("OPENAI_API_KEY", None)
+    os.environ.pop("CHURRO_PROVIDER", None)
+    os.environ.pop("CHURRO_MODEL", None)
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -267,6 +280,153 @@ def test_main_graceful_without_api_key():
     finally:
         if saved is not None:
             os.environ["OPENAI_API_KEY"] = saved
+        if saved_provider is not None:
+            os.environ["CHURRO_PROVIDER"] = saved_provider
+        else:
+            os.environ.pop("CHURRO_PROVIDER", None)
+        if saved_model is not None:
+            os.environ["CHURRO_MODEL"] = saved_model
+        else:
+            os.environ.pop("CHURRO_MODEL", None)
+
+
+def test_switch_ollama_through_default_factory():
+    session = new_session()
+    app, outputs = make_app(
+        session, FakeProvider(), ["/switch ollama:qwen3:14b", "/status", "/quit"]
+    )
+    run(app, outputs)
+
+    assert session.active_provider == "ollama"
+    assert session.active_model == "qwen3:14b"
+    assert app.provider.name == "ollama"
+    assert app.provider.model == "qwen3:14b"
+
+    text = outputs.getvalue()
+    assert "Switched openai/gpt-4o -> ollama/qwen3:14b" in text
+    assert "Provider:  ollama" in text
+    assert "Model:     qwen3:14b" in text
+
+
+def test_switch_ollama_with_registered_builder():
+    session = new_session()
+    session.conversation_history.append(
+        ConversationMessage(role="user", content="old user message")
+    )
+    registry = {
+        "ollama": lambda model=None: FakeProvider(name="ollama", model=model or "qwen3:14b")
+    }
+    app, outputs = make_app(
+        session, FakeProvider(), ["/switch ollama:qwen3:14b", "/quit"], registry=registry
+    )
+    run(app, outputs)
+
+    assert session.active_provider == "ollama"
+    assert session.active_model == "qwen3:14b"
+    assert app.provider.model == "qwen3:14b"
+    assert session.state.goal == "Fix the login bug"
+    assert len(session.archived_conversations) == 1
+    assert session.conversation_history == []
+    assert "Switched openai/gpt-4o -> ollama/qwen3:14b" in outputs.getvalue()
+
+
+def test_status_after_openai_switch():
+    registry = {
+        "openai": lambda model=None: FakeProvider(name="openai", model=model or "gpt-4o")
+    }
+    app, outputs = make_app(
+        new_session(), FakeProvider(), ["/switch openai:gpt-4o", "/status", "/quit"],
+        registry=registry,
+    )
+    run(app, outputs)
+
+    text = outputs.getvalue()
+    assert "Provider:  openai" in text
+    assert "Model:     gpt-4o" in text
+
+
+def test_status_never_leaks_api_keys():
+    app, outputs = make_app(new_session(), FakeProvider(), ["/status", "/quit"])
+    run(app, outputs)
+
+    text = outputs.getvalue()
+    assert "sk-" not in text
+    assert "OPENAI_API_KEY" not in text
+
+
+def test_switch_usage_lists_providers():
+    app, outputs = make_app(new_session(), FakeProvider(), ["/switch", "/quit"])
+    run(app, outputs)
+
+    text = outputs.getvalue()
+    assert "Usage:" in text
+    assert "ollama" in text
+    assert "openai" in text
+
+
+def test_invalid_switch_missing_model():
+    session = new_session()
+    app, outputs = make_app(session, FakeProvider(), ["/switch ollama:", "/quit"])
+    run(app, outputs)
+
+    text = outputs.getvalue()
+    assert "missing model name" in text
+    assert session.active_provider == "openai"
+    assert session.active_model == "gpt-4o"
+    assert len(session.archived_conversations) == 0
+
+
+def test_switch_builder_error_leaves_session_intact():
+    session = new_session()
+    session.conversation_history.append(
+        ConversationMessage(role="user", content="still here")
+    )
+
+    def broken(model=None):
+        raise APIRequestError("ollama server unreachable")
+
+    app, outputs = make_app(
+        session, FakeProvider(), ["/switch ollama:qwen3:14b", "/quit"],
+        registry={"ollama": broken},
+    )
+    run(app, outputs)
+
+    assert "ollama server unreachable" in outputs.getvalue()
+    assert session.active_provider == "openai"
+    assert session.active_model == "gpt-4o"
+    assert len(session.conversation_history) == 1
+    assert len(session.archived_conversations) == 0
+
+
+def test_workspace_defaults_to_cwd_when_env_unset():
+    old = os.environ.pop("CHURRO_WORKSPACE", None)
+    try:
+        assert _workspace_root_from_env() == Path.cwd()
+    finally:
+        if old is not None:
+            os.environ["CHURRO_WORKSPACE"] = old
+
+
+def test_workspace_honors_churro_workspace_env():
+    with tempfile.TemporaryDirectory() as tmp:
+        old = os.environ.pop("CHURRO_WORKSPACE", None)
+        try:
+            os.environ["CHURRO_WORKSPACE"] = tmp
+            assert _workspace_root_from_env() == Path(tmp)
+        finally:
+            os.environ.pop("CHURRO_WORKSPACE", None)
+            if old is not None:
+                os.environ["CHURRO_WORKSPACE"] = old
+
+
+def test_sessions_dir_is_project_root_sessions():
+    assert SESSIONS_DIR == PROJECT_ROOT / "sessions"
+
+
+def test_default_tool_registry_binds_to_project_root():
+    registry = default_tool_registry(PROJECT_ROOT)
+    for name in ("read_file", "list_files", "run_tests"):
+        assert registry.get(name)._workspace == PROJECT_ROOT
 
 
 TEST_FUNCTIONS = [
@@ -288,6 +448,17 @@ TEST_FUNCTIONS = [
     test_empty_input_ignored,
     test_unknown_command,
     test_main_graceful_without_api_key,
+    test_switch_ollama_through_default_factory,
+    test_switch_ollama_with_registered_builder,
+    test_status_after_openai_switch,
+    test_status_never_leaks_api_keys,
+    test_switch_usage_lists_providers,
+    test_invalid_switch_missing_model,
+    test_workspace_defaults_to_cwd_when_env_unset,
+    test_workspace_honors_churro_workspace_env,
+    test_sessions_dir_is_project_root_sessions,
+    test_default_tool_registry_binds_to_project_root,
+    test_switch_builder_error_leaves_session_intact,
 ]
 
 

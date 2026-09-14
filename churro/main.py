@@ -1,14 +1,21 @@
-"""CHURRO v0.1 - the interactive terminal application.
+"""CHURRO - the interactive terminal application.
 
-Run with:  python -m churro   (requires OPENAI_API_KEY)
+Run with:  python -m churro   (requires OPENAI_API_KEY by default)
+
+The startup provider is configurable with CHURRO_PROVIDER / CHURRO_MODEL
+(see factory.startup_provider_spec), so local-Ollama-only setups start
+without an OpenAI key.
 """
 
+import json
+import os
 import sys
 from pathlib import Path
 from typing import Callable
 
 from rich.console import Console
 
+from churro.agent import AgentResult, AgentRunner, DEFAULT_MAX_ITERATIONS
 from churro.core.handoff import build_handoff, character_count, estimate_tokens, format_state
 from churro.core.session import (
     ArchivedConversation,
@@ -20,19 +27,49 @@ from churro.core.session import (
 )
 from churro.core.session_manager import process_ai_response
 from churro.prompts import load_system_prompt
-from churro.providers.openai_provider import OpenAIProvider
+from churro.providers.factory import (
+    ProviderFactory,
+    default_provider_factory,
+    parse_provider_spec,
+    startup_provider_spec,
+)
 from churro.providers.provider import Provider, ProviderError, MissingAPIKeyError
+from churro.tools import ToolRegistry, default_tool_registry
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CHURRO_WORKSPACE_ENV = "CHURRO_WORKSPACE"
+
+
+def _workspace_root_from_env() -> Path:
+    """Return the workspace root from ``CHURRO_WORKSPACE`` or ``Path.cwd()``."""
+    raw = os.environ.get(CHURRO_WORKSPACE_ENV, "").strip()
+    return Path(raw) if raw else Path.cwd()
+
+
+PROJECT_ROOT = _workspace_root_from_env()
 SESSIONS_DIR = PROJECT_ROOT / "sessions"
 
-ProviderFactory = Callable[[str | None], Provider]
+AGENT_MAX_ITERATIONS_ENV = "CHURRO_AGENT_MAX_ITERATIONS"
+
+# Application-level activity status shown while the agent waits on the model.
+AGENT_STATUS_MESSAGE = "CHURRO is thinking..."
+
+
+def _agent_iteration_limit_from_env() -> int:
+    raw = os.environ.get(AGENT_MAX_ITERATIONS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MAX_ITERATIONS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_ITERATIONS
+    return value if value > 0 else DEFAULT_MAX_ITERATIONS
 
 HELP_TEXT = """Commands:
   <message>                    Send a message to the active model
   /status                      Show the persistent project state
   /save                        Save the session to disk now
-  /switch <provider[:model]>   Switch provider/model (v0.1: openai only)
+  /switch <provider[:model]>   Switch provider/model (openai, ollama)
+  /agent <task>                Run a bounded AgentRunner over the task
   /handoff                     Show the handoff another model would receive
   /files                       Show relevant files from state
   /help                        Show this help
@@ -46,7 +83,10 @@ class CHURROApp:
         provider: Provider,
         system_prompt: str,
         session_path: str | Path,
-        provider_registry: dict[str, ProviderFactory] | None = None,
+        provider_registry: dict[str, Callable[[str | None], Provider]] | None = None,
+        provider_factory: ProviderFactory | None = None,
+        tool_registry: ToolRegistry | None = None,
+        agent_max_iterations: int | None = None,
         input_fn: Callable[[str], str] | None = None,
         console: Console | None = None,
     ):
@@ -55,11 +95,29 @@ class CHURROApp:
         self.system_prompt = system_prompt
         self.session_path = Path(session_path)
 
-        if provider_registry is None:
-            def _make_openai(model: str | None = None) -> Provider:
-                return OpenAIProvider(model=model) if model else OpenAIProvider()
-            provider_registry = {"openai": _make_openai}
-        self.provider_registry = provider_registry
+        if provider_factory is None:
+            factory = ProviderFactory()
+            if provider_registry is not None:
+                for name, builder in provider_registry.items():
+                    factory.register(name, builder)
+            else:
+                factory = default_provider_factory()
+            provider_factory = factory
+        self.provider_factory = provider_factory
+
+        if tool_registry is None:
+            tool_registry = default_tool_registry(PROJECT_ROOT)
+        self.tool_registry = tool_registry
+
+        if agent_max_iterations is None:
+            agent_max_iterations = _agent_iteration_limit_from_env()
+        if (
+            isinstance(agent_max_iterations, bool)
+            or not isinstance(agent_max_iterations, int)
+            or agent_max_iterations <= 0
+        ):
+            raise ValueError("agent_max_iterations must be a positive integer")
+        self.agent_max_iterations = agent_max_iterations
 
         self.input_fn = input_fn if input_fn is not None else input
         self.console = console if console is not None else Console()
@@ -170,6 +228,9 @@ class CHURROApp:
         if cmd == "/switch":
             self._command_switch(arg)
             return True
+        if cmd == "/agent":
+            self._command_agent(arg)
+            return True
 
         self.console.print(f"Unknown command: {cmd}", markup=False)
         self.console.print("Type /help to list commands.", markup=False)
@@ -181,7 +242,8 @@ class CHURROApp:
         lines = [
             f"Session:   {s.session_id}",
             f"Created:   {s.created_at}",
-            f"Provider:  {s.active_provider} / {s.active_model}",
+            f"Provider:  {s.active_provider}",
+            f"Model:     {s.active_model}",
             f"Status:    {st.status}",
             f"Goal:      {st.goal}",
             f"Current:   {st.current_task}",
@@ -220,31 +282,111 @@ class CHURROApp:
         else:
             self.console.print("None", markup=False)
 
-    def _command_switch(self, spec: str) -> None:
-        available = ", ".join(sorted(self.provider_registry))
-        if not spec:
-            self.console.print("Usage: /switch <provider>  or  /switch <provider:model>", markup=False)
-            self.console.print(f"Available providers: {available}", markup=False)
+    def _command_agent(self, task: str) -> None:
+        task = task.strip()
+        if not task:
+            self.console.print("Usage: /agent <task>", markup=False)
+            self.console.print(
+                "Starts a bounded AgentRunner that may use the project tools.",
+                markup=False,
+            )
             return
 
-        name, _, model = spec.partition(":")
-        name = name.strip().lower()
-        model = model.strip() or None
+        self.session.conversation_history.append(
+            ConversationMessage(role="user", content=task)
+        )
 
-        factory = self.provider_registry.get(name)
-        if factory is None:
+        self.console.print("-- Agent --", markup=False)
+        self.console.print(f"> Starting agent on task: {task}", markup=False)
+
+        runner = AgentRunner(
+            provider=self.provider,
+            registry=self.tool_registry,
+            max_iterations=self.agent_max_iterations,
+        )
+        try:
+            with self.console.status(AGENT_STATUS_MESSAGE, spinner="dots"):
+                result: AgentResult = runner.run(self._build_messages())
+        except KeyboardInterrupt:
+            self.console.print("> Agent interrupted by Ctrl+C.", markup=False)
+            self._save()
+            return
+
+        arguments_by_id: dict[str, dict] = {}
+        for message in result.messages:
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                call_id = getattr(call, "id", "")
+                if call_id:
+                    arguments_by_id[call_id] = getattr(call, "arguments", {}) or {}
+
+        for execution in result.tool_executions:
+            marker = "" if execution.result.success else " (failed)"
+            self.console.print(f"[tool] {execution.tool_name}{marker}", markup=False)
+            arguments = arguments_by_id.get(execution.call_id)
+            if arguments is not None:
+                self.console.print(
+                    f"      args: {json.dumps(arguments, sort_keys=True)}",
+                    markup=False,
+                )
+            if not execution.result.success:
+                reason = (execution.result.error or "").strip()
+                if not reason:
+                    reason = "(no error details)"
+                self.console.print(f"      error: {reason}", markup=False)
+
+        raw_final = result.final_text.strip()
+        processed = None
+        clean_answer = ""
+        if raw_final:
+            processed = process_ai_response(self.session, raw_final)
+            clean_answer = processed.clean_response
+        else:
+            self.session.conversation_history.append(
+                ConversationMessage(role="assistant", content="(agent output)")
+            )
+
+        if result.completed:
+            if not clean_answer:
+                self.console.print(
+                    "> Agent finished with no text response.", markup=False
+                )
+            else:
+                self.console.print(">", markup=False)
+                self.console.print(clean_answer, markup=False)
+        else:
+            reason = result.error or (
+                f"iteration limit reached after {result.iterations} iterations"
+            )
+            self.console.print(f"> Agent stopped: {reason}", markup=False)
+            if clean_answer:
+                self.console.print(clean_answer, markup=False)
+
+        if processed is not None:
+            for warning in processed.warnings:
+                self.console.print(f"note: {warning}", markup=False)
+
+        self._save()
+
+    def _command_switch(self, spec: str) -> None:
+        available = ", ".join(self.provider_factory.supported_providers())
+        if not spec:
             self.console.print(
-                f"Provider '{name}' is not available in CHURRO v0.1.", markup=False
+                "Usage: /switch <provider>  or  /switch <provider:model>", markup=False
             )
             self.console.print(f"Available providers: {available}", markup=False)
             return
 
         try:
-            new_provider = factory(model)
+            parsed = parse_provider_spec(spec)
+            new_provider = self.provider_factory.create(parsed)
         except ProviderError as exc:
-            self.console.print(f"Could not build provider '{name}': {exc}", markup=False)
+            self.console.print(f"Could not build provider: {exc}", markup=False)
             return
 
+        name = parsed.provider_name
         old = f"{self.session.active_provider}/{self.session.active_model}"
         self.session.archived_conversations.append(
             ArchivedConversation(
@@ -278,6 +420,7 @@ def _start_new_session(
     input_fn: Callable[[str], str],
     model: str,
     sessions_dir: Path | None = None,
+    provider_name: str = "openai",
 ) -> tuple[Session, Path]:
     sessions_dir = sessions_dir or SESSIONS_DIR
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -290,7 +433,7 @@ def _start_new_session(
             break
         console.print("A goal is required to start a session.", markup=False)
 
-    session = create_session(goal=goal, provider="openai", model=model)
+    session = create_session(goal=goal, provider=provider_name, model=model)
     path = sessions_dir / f"{session.session_id}.json"
     save_session(session, str(path))
     return session, path
@@ -302,11 +445,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         system_prompt = load_system_prompt()
-        provider: Provider = OpenAIProvider()
+        factory = default_provider_factory()
+        spec = startup_provider_spec()
+        parsed = parse_provider_spec(spec)
+        provider: Provider = factory.create(parsed)
     except MissingAPIKeyError as exc:
         console.print(str(exc), markup=False)
         console.print(
             "Set OPENAI_API_KEY in your environment, then run: python -m churro",
+            markup=False,
+        )
+        console.print(
+            "Or start with a local provider: set CHURRO_PROVIDER=ollama "
+            "(and CHURRO_MODEL=<model>) in your environment.",
             markup=False,
         )
         return 1
@@ -320,20 +471,22 @@ def main(argv: list[str] | None = None) -> int:
             session = load_session(str(path))
             console.print(f"Loaded session {session.session_id}.", markup=False)
         else:
-            session, path = _start_new_session(console, input, provider.model)
+            session, path = _start_new_session(
+                console,
+                input,
+                provider.model,
+                provider_name=provider.name,
+            )
     except (OSError, ValueError, KeyboardInterrupt, EOFError) as exc:
         console.print(f"Could not start session: {exc}", markup=False)
         return 1
-
-    def _make_openai(model: str | None = None) -> Provider:
-        return OpenAIProvider(model=model) if model else OpenAIProvider()
 
     app = CHURROApp(
         session=session,
         provider=provider,
         system_prompt=system_prompt,
         session_path=path,
-        provider_registry={"openai": _make_openai},
+        provider_factory=factory,
         console=console,
     )
     return app.run()

@@ -41,6 +41,28 @@ $env:OPENAI_API_KEY = "sk-..."
 Never put a real key in code or commit one. CHURRO reads the key only from
 the environment.
 
+## Provider selection
+
+CHURRO selects providers from a small spec string, `provider` or
+`provider:model`. OpenAI and Ollama are both optional and independently
+configurable:
+
+```powershell
+/switch openai:gpt-4o-mini      # cloud OpenAI, explicit model
+/switch openai                  # OpenAI, provider default model
+/switch ollama:qwen3:14b        # local Ollama, explicit model
+/switch ollama                  # local Ollama, model from OLLAMA_MODEL
+```
+
+Ollama is optional and local — CHURRO does not require it. When `ollama` is
+selected without a model, CHURRO uses the `OLLAMA_MODEL` environment
+variable (see `.env.example`). `OLLAMA_BASE_URL` points the provider at a
+running local Ollama server and defaults to `http://localhost:11434/v1`, so
+no Ollama setup is needed for OpenAI-only use. `/status` shows the active
+`Provider:` and `Model:` on separate lines and never displays API keys. The
+same `provider[:model]` spec is used at startup (`CHURRO_PROVIDER` /
+`CHURRO_MODEL`), so a local-Ollama-only setup never needs an OpenAI key.
+
 ## Start CHURRO
 
 ```powershell
@@ -54,6 +76,32 @@ First launch asks for a goal, creates a session, and saves it to
 python -m churro sessions/<session-id>.json
 ```
 
+### Startup provider
+
+CHURRO picks its startup provider from the environment using
+`CHURRO_PROVIDER` and `CHURRO_MODEL`:
+
+```powershell
+# Start directly with local Ollama — no OpenAI key required.
+$env:CHURRO_PROVIDER = "ollama"
+$env:CHURRO_MODEL = "qwen3:14b"
+python -m churro
+```
+
+```powershell
+# Or start with OpenAI and an explicit model.
+$env:CHURRO_PROVIDER = "openai"
+$env:CHURRO_MODEL = "gpt-4o-mini"
+python -m churro
+```
+
+When neither variable is set, CHURRO keeps its default of OpenAI (which
+still requires `OPENAI_API_KEY`). `CHURRO_PROVIDER` may also carry the model
+inline (`CHURRO_PROVIDER=ollama:qwen3:14b`); an invalid provider or config
+reports a clear startup error and exits. Only the configured provider is
+constructed at startup — no network or key checks happen for providers you
+did not select (see `.env.example` for commented examples).
+
 ## Commands
 
 | Command | Action |
@@ -61,7 +109,8 @@ python -m churro sessions/<session-id>.json
 | `<message>` | Send a message to the active model |
 | `/status` | Show the persistent project state |
 | `/save` | Save the session now |
-| `/switch <provider[:model]>` | Switch provider/model (v0.1: `openai` only) |
+| `/switch <provider[:model]>` | Switch provider/model (`openai`, `ollama`) |
+| `/agent <task>` | Run a bounded `AgentRunner` over the task |
 | `/handoff` | Show the handoff another model would receive |
 | `/files` | Show relevant files from state |
 | `/help` | List commands |
@@ -89,10 +138,53 @@ Switched openai/gpt-4o -> openai/gpt-4o-mini
 The new model starts from a fresh handoff; the old conversation context was archived.
 ```
 
-Only `openai` exists in v0.1. `/switch anthropic` reports a clear error and
-leaves the session untouched. The architecture (a provider registry, a
-shared provider interface, and handoffs built from state) is what makes
-additional providers a later, additive step.
+CHURRO v0.2 supports `openai` and `ollama`. `/switch anthropic` (or any
+other unregistered provider) reports a clear error and leaves the session
+untouched. A `ProviderFactory` selects and constructs providers from a
+small spec, so adding another provider later is just a provider
+implementation plus one factory registration — never a CLI change.
+
+## Agent mode (v0.2)
+
+`/agent <task>` runs the existing bounded `AgentRunner` against the
+currently active provider (whichever provider/model `/switch` selected last)
+using the standard CHURRO tool registry. The agent is invoked explicitly —
+normal messages are still plain chat:
+
+```
+> /agent check auth.py for the unicode bug
+-- Agent --
+> Starting agent on task: check auth.py for the unicode bug
+[tool] search_files
+[tool] read_file
+> The bug is at auth.py:42; the regex rejects non-ASCII characters.
+```
+
+- Tool activity is shown as concise `[tool] <name>` lines; a failed tool is
+  marked `[tool] <name> (failed)`.
+- The run is bounded: it stops when the model stops calling tools or when
+  the iteration budget is exhausted (no unbounded loops).
+- Provider failures, tool failures, and the iteration limit are surfaced to
+  the console; nothing is retried and the provider/model is never switched
+  automatically.
+- The user's task and the agent's final answer are appended to the session
+  conversation, so the session file stays the single source of truth. The
+  agent's internal tool transcript is not dumped into state. The agent's
+  `<state_update>` proposal (when present) is processed through the
+  existing session pipeline so that useful state (status, current_task,
+  next_action, notes, completed_work, blockers, relevant_files) is
+  persisted; the session goal is never overwritten.
+- The iteration budget defaults to 10 and is configurable at startup with
+  `CHURRO_AGENT_MAX_ITERATIONS` (a positive integer); passing an invalid
+  value falls back to the default.
+- While an agent run is in flight, the CLI shows a single transient Rich
+  status (`⠋ CHURRO is thinking...`) so slow local inference does not look
+  frozen; it disappears when the run finishes and `Ctrl+C` stops it cleanly
+  and returns to the prompt.
+
+> Safety: the tools are workspace-confined but execute trusted local
+> commands (`run_command`, `write_file`, etc.) on your machine — they are not
+> sandboxed and run as your user. Use `/agent` on tasks you understand.
 
 ## Offline demo (no API key)
 
@@ -118,7 +210,7 @@ python examples/demo_openai_provider.py
 
 ## Tests
 
-404 tests, all offline — no API key or network required:
+505 tests, all offline — no API key or network required:
 
 ```powershell
 $env:PYTHONPATH = "D:\AI PROJECT"
@@ -127,6 +219,9 @@ python tests/test_session_manager.py
 python tests/test_handoff.py
 python tests/test_openai_provider.py
 python tests/test_cli_app.py
+python tests/test_cli_agent.py
+python tests/test_agent_spinner.py
+python tests/test_startup_config.py
 python tests/test_tools.py
 python tests/test_read_file.py
 python tests/test_list_files.py
@@ -141,6 +236,7 @@ python tests/test_result_messages.py
 python tests/test_agent_runner.py
 python tests/test_openai_tool_messages.py
 python tests/test_ollama_provider.py
+python tests/test_provider_factory.py
 ```
 
 ## Directory layout
@@ -165,9 +261,11 @@ churro/
     openai_provider.py    OpenAI Chat Completions provider (openai SDK)
     ollama_provider.py    Ollama provider (stdlib HTTP only, no SDK)
     openai_compat.py      shared OpenAI-compatible wire format translation
+    factory.py            ProviderSpec, ProviderFactory, startup spec, selection
   tools/
     tool.py               Tool, ToolArgs, ToolResult, and tool error types
     registry.py           ToolRegistry: register / get / list / execute
+    __init__.py           default_tool_registry: canonical 7-tool setup
     workspace.py          workspace containment, relative display, file walk
     read_file.py          read_file: workspace-confined UTF-8 file reader
     list_files.py         list_files: deterministic workspace tree listing
@@ -194,8 +292,8 @@ of truth.
 
 ## Tool system (v0.2)
 
-CHURRO is gaining a generic tool system. All v0.2 tools are implemented;
-wiring them to the LLM is the next step. Nothing is wired yet.
+CHURRO is gaining a generic tool system. All v0.2 tools are implemented and
+wired to the LLM through the `/agent` command.
 
 ```
 churro/tools/tool.py
@@ -395,37 +493,55 @@ changes to tracked files (including staged new files) are visible.
 ### run_tests
 
 Runs the project's test suite from the workspace and returns structured
-results. With no `command`, it detects pytest (via `find_spec` on the
-current interpreter) and runs `python -m pytest` as an argument list; if
-pytest is unavailable it fails cleanly with `No test runner detected`,
-rather than inventing a framework. Only Python/pytest detection is
-supported:
+results.
+
+**Explicit command.** A provided `command` is executed exactly as given
+(shell execution, like `run_command` — trusted, NOT sandboxed — so
+project-specific commands work unchanged) and its exit status, stdout,
+and stderr are reported.
+
+**Automatic discovery.** With no `command`, the project's test
+convention is discovered rather than guessed:
+`python -m pytest` (current interpreter) is used only when the project
+clearly uses pytest (`pytest.ini`, `conftest.py`, or pytest configuration
+in `pyproject.toml` / `setup.cfg` / `tox.ini`). Otherwise the plain-Python
+convention is used: every file matching `tests/test_*.py` is run with the
+current interpreter (`sys.executable`, never an assumed `python`) as its
+own subprocess, in deterministic sorted order, without importing test
+modules into CHURRO. Each discovered test subprocess also runs with the
+workspace root placed on `PYTHONPATH` (existing entries preserved), so
+project imports such as `import churro` resolve from under `tests/`.
+Results are aggregated:
 
 ```python
-result = registry.execute("run_tests", {"timeout_seconds": 300})
-# Test command:
-# python -m pytest
+result = registry.execute("run_tests", {})
+# Test suite:
+# 23 files discovered
+# 23 files executed
+# 23 passed
+# 0 failed
+# 0 infrastructure failures
 #
-# Exit code: 0
-#
-# STDOUT:
-# 1 passed in 0.01s
-#
-# STDERR:
-# (empty)
-#
-# Tests passed.
+# Overall: 23 passed, 0 failed, 0 infrastructure failure(s).
 ```
 
-A provided `command` is executed exactly as given (shell execution, like
-`run_command` — trusted, NOT sandboxed — so project-specific commands work
-unchanged). `timeout_seconds` defaults to 120, must be a positive integer,
-and is capped at 300; on timeout the process tree is terminated and any
-partial output is preserved. `success=True` only for exit code 0. stdout
-and stderr are capped separately to ~20,000 characters total
-(constructor-configurable via `max_output_chars`, plus a 200-character cap
-on the echoed command) with explicit truncation markers. The workspace is
-always the cwd and there is no `cwd` argument.
+**Failure semantics.** Infrastructure/execution failures (a file cannot
+start, the interpreter is unavailable, a subprocess times out, or no
+matching test files exist) are reported separately from test-suite
+failures (tests ran but exited non-zero), so the agent can reason about
+what actually happened — e.g. error `Test infrastructure failure: ...`
+vs `Test suite executed but tests failed: ...`. Failing and failing-to-run
+files are listed with their relevant stdout/stderr.
+
+`timeout_seconds` defaults to 120, must be a positive integer, and is
+capped at 300; for automatic discovery it applies to **each** test-file
+subprocess individually, and on timeout the process tree is terminated
+and partial output is preserved. Aggregate output is capped to ~20,000
+characters (constructor-configurable via `max_output_chars`, plus a
+200-character cap on the echoed explicit command) with explicit
+truncation markers. `success=True` only when everything ran and every
+test file exited 0. The workspace is always the working directory and
+there is no `cwd` argument. No pytest install is required.
 
 ### Tool calling normalization (v0.2)
 
@@ -499,8 +615,9 @@ SessionState or conversation-history mutation, and no autonomous loop.
 Sending these results back to an LLM is the next (agent-loop) step.
 
 `ToolDefinition.from_tool(...)` still describes the tools available to a
-provider; automatically discovering/registering every tool and forwarding
-the definitions to the provider is intentionally not wired up yet.
+provider; the CLI's `/agent` command now builds the canonical registry via
+`default_tool_registry(...)` and forwards those definitions to the provider
+through `AgentRunner`.
 
 ### Tool-result messages (v0.2)
 
@@ -656,3 +773,37 @@ messages, response parsing) now lives once in
 adapter keeps only its own transport: OpenAI uses the `openai` SDK,
 Ollama uses `urllib`. No provider-specific formatting is duplicated, and no
 core module imports either adapter's SDK.
+
+### Provider factory & selection (v0.2)
+
+The CLI never constructs providers itself — it asks a `ProviderFactory`
+(`churro/providers/factory.py`) for one. A provider spec is a tiny
+normalized value:
+
+```
+"ollama:qwen3:14b"   ->  ProviderSpec(provider_name="ollama", model_name="qwen3:14b")
+"openai:gpt-4o"      ->  ProviderSpec(provider_name="openai", model_name="gpt-4o")
+"ollama"             ->  ProviderSpec(provider_name="ollama", model_name=None)
+```
+
+`parse_provider_spec` validates the syntax (empty specs, missing provider,
+and missing model all fail cleanly with `ProviderSpecError`); the factory
+resolves the provider name to its registered builder and passes the model
+to the provider's own constructor, which owns environment defaults:
+`OLLAMA_MODEL` / `OLLAMA_BASE_URL` for Ollama, `OPENAI_API_KEY` for OpenAI.
+No specific Ollama model is hardcoded.
+
+```
+                    CLI
+                     │
+                     ▼
+              ProviderFactory
+             ┌───────┴───────┐
+             ▼               ▼
+      OpenAIProvider   OllamaProvider
+```
+
+Provider builders are imported lazily inside the factory, so importing
+`factory.py` requires no SDK. Adding Anthropic/Gemini/etc. later means one
+provider implementation plus one `factory.register("anthropic", builder)`
+call — the CLI's `/switch` and `/status` stay unchanged.

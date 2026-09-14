@@ -139,5 +139,7 @@ class OllamaProvider(Provider):
             return self._post(url, payload, self.timeout_seconds)
         except ProviderError:
             raise
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:
             raise APIRequestError(f"Ollama request failed: {exc}") from exc

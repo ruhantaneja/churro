@@ -18,6 +18,7 @@ from churro.tools import (
 )
 from churro.tools.executor import ToolExecutionBatch, ToolExecutionResult
 from churro.tools.result_messages import (
+    _FAILURE_OUTPUT_LIMIT_CHARS,
     result_content,
     result_message_from_execution,
     result_messages_from_batch,
@@ -267,6 +268,99 @@ def test_batch_conversion_through_executor_cycle():
     assert messages[1].content == "2"
 
 
+# ---- failure content combines error and captured output ----
+
+
+def test_failure_with_error_and_output_contains_both():
+    result = ToolResult(
+        success=False,
+        error="Test suite executed but tests failed: 1 of 24 file(s) exited non-zero",
+        output="Failed: tests/test_x.py\nModuleNotFoundError: No module named 'x'",
+    )
+    content = result_content(result)
+    assert "Test suite executed but tests failed" in content
+    assert "tests/test_x.py" in content
+    assert "ModuleNotFoundError" in content
+
+
+def test_failure_with_error_appears_before_details():
+    result = ToolResult(
+        success=False,
+        error="Command exited with code 1",
+        output="error: undefined symbol foo\nbuild failed",
+    )
+    content = result_content(result)
+    assert content.index("Command exited with code 1") < content.index("undefined symbol")
+    assert content.startswith("Command exited with code 1")
+
+
+def test_failure_with_error_only():
+    result = ToolResult(success=False, error="Some failure", output="")
+    assert result_content(result) == "Some failure"
+
+
+def test_failure_with_output_only():
+    result = ToolResult(success=False, error="", output="actual stderr/stdout")
+    assert result_content(result) == "actual stderr/stdout"
+
+
+def test_failure_with_neither_uses_placeholder():
+    assert result_content(ToolResult(success=False)) == "(tool failed with no error details)"
+
+
+def test_successful_result_unchanged():
+    result = ToolResult(success=True, output="all good")
+    assert result_content(result) == "all good"
+    assert result_content(ToolResult(success=True)) == "(tool returned no output)"
+
+
+def test_failure_content_is_deterministic_and_ordered():
+    result = ToolResult(
+        success=False,
+        error="boom",
+        output="first\ndetails",
+    )
+    first = result_content(result)
+    second = result_content(result)
+    assert first == second
+    assert first == "boom\n\nfirst\ndetails"
+
+
+def test_failure_output_not_duplicated_when_identical_to_error():
+    result = ToolResult(success=False, error="same text", output="same text")
+    assert result_content(result) == "same text"
+
+
+def test_large_failure_output_respects_limit():
+    big = "x" * (_FAILURE_OUTPUT_LIMIT_CHARS + 500)
+    result = ToolResult(
+        success=False,
+        error="too much output",
+        output=big,
+    )
+    content = result_content(result)
+    expected_marker = (
+        f"\n... [output truncated at {_FAILURE_OUTPUT_LIMIT_CHARS} characters]"
+    )
+    assert expected_marker in content
+    details = content[content.index("\n\n") + 2:]
+    assert details.startswith("x" * _FAILURE_OUTPUT_LIMIT_CHARS)
+    assert len(details) <= _FAILURE_OUTPUT_LIMIT_CHARS + len(expected_marker)
+
+
+def test_tool_result_not_mutated():
+    result = ToolResult(
+        success=False,
+        error="boom",
+        output="  details\n",
+    )
+    snapshot = result.model_copy(deep=True)
+    result_content(result)
+    assert result == snapshot
+    assert result.output == "  details\n"
+    assert result.error == "boom"
+
+
 TEST_FUNCTIONS = [
     test_successful_execution_to_message,
     test_failed_execution_to_message,
@@ -288,6 +382,16 @@ TEST_FUNCTIONS = [
     test_message_has_only_neutral_fields,
     test_empty_batch_from_real_executor,
     test_batch_conversion_through_executor_cycle,
+    test_failure_with_error_and_output_contains_both,
+    test_failure_with_error_appears_before_details,
+    test_failure_with_error_only,
+    test_failure_with_output_only,
+    test_failure_with_neither_uses_placeholder,
+    test_successful_result_unchanged,
+    test_failure_content_is_deterministic_and_ordered,
+    test_failure_output_not_duplicated_when_identical_to_error,
+    test_large_failure_output_respects_limit,
+    test_tool_result_not_mutated,
 ]
 
 

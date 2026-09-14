@@ -202,6 +202,31 @@ def test_session_save_load_after_processing(tmp_path: Path | None = None):
     assert loaded.conversation_history[-1].content == "Found it."
 
 
+def test_goal_cannot_be_overwritten_by_state_update():
+    session = make_session()
+    proposal = {"goal": "Replaced goal", "next_action": "Keep going"}
+    result = process_ai_response(session, "Doing work.\n" + state_block(proposal))
+
+    assert session.state.goal == "Fix the unicode email bug in auth.py"
+    assert session.state.next_action == "Keep going"
+    assert result.merged_fields == {"next_action": "Keep going"}
+    assert "goal" not in result.merged_fields
+    assert any("protected" in w for w in result.warnings)
+
+
+def test_goal_only_state_update_leaves_state_unchanged():
+    session = make_session()
+    before = session.state.model_dump()
+    result = process_ai_response(
+        session, "No change.\n" + state_block({"goal": "some other goal"})
+    )
+
+    assert session.state.goal == "Fix the unicode email bug in auth.py"
+    assert result.merged_fields == {}
+    assert session.state.model_dump() == before
+    assert any("protected" in w for w in result.warnings)
+
+
 TEST_FUNCTIONS = [
     test_valid_response_updates_state,
     test_invalid_fields_do_not_overwrite_existing_state,
@@ -214,6 +239,8 @@ TEST_FUNCTIONS = [
     test_relevant_files_are_replaced,
     test_malformed_response_does_not_crash,
     test_session_save_load_after_processing,
+    test_goal_cannot_be_overwritten_by_state_update,
+    test_goal_only_state_update_leaves_state_unchanged,
 ]
 
 
