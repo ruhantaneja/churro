@@ -1,0 +1,1 @@
+Fix the shopping cart project: make ShoppingCart.total() apply the correct bulk-discount pricing, and make the full test suite under tests/ pass. Use the run_tests tool to run and verify the tests. Do not modify any test files.
