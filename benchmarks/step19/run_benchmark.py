@@ -12,6 +12,7 @@ and run artifact is written outside the repo.
 Usage:
     python run_benchmark.py [--model qwen3.5:4b]
         [--workspace PATH] [--runs-dir PATH] [--timeout SECONDS]
+        [--churro-root PATH] [--condition A|B]
 """
 
 import argparse
@@ -152,6 +153,149 @@ def parse_tool_trace(log_text: str) -> list[tuple[str, bool]]:
     return trace
 
 
+def _consume_continuation(lines: list[str], start: int) -> int:
+    """Return index just past the block starting at *start*.
+
+    A block is a directive line (``args:``/``error:``) plus any following
+    continuation lines. Continuation ends at the next directive line, the next
+    ``[tool]`` line, or end of input. Rich soft-wraps long argument payloads
+    across several lines, so a single JSON object may span many lines.
+    """
+    i = start + 1
+    while i < len(lines):
+        nxt = lines[i].strip()
+        if (
+            nxt.startswith("[tool] ")
+            or nxt.startswith("args:")
+            or nxt.startswith("error:")
+        ):
+            break
+        i += 1
+    return i
+
+
+def _unfold(lines: list[str]) -> str:
+    """Join a wrapped block back into a single line."""
+    return " ".join(line.strip() for line in lines)
+
+
+def parse_detailed_trace(log_text: str) -> list[dict]:
+    """Parse agent_run.log into a list of tool-call records with arguments.
+
+    Each record: ``{name, success, args, error}`` where *args* is the parsed
+    JSON dict from the ``args:`` line (empty dict if unparseable) and *error*
+    is the error message string (empty string if absent).
+    """
+    records: list[dict] = []
+    lines = log_text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line.startswith("[tool] "):
+            i += 1
+            continue
+        body = line[len("[tool] ") :]
+        failed = body.endswith(" (failed)")
+        name = body[: -len(" (failed)")] if failed else body
+        record: dict = {"name": name, "success": not failed, "args": {}, "error": ""}
+        i += 1
+        while i < len(lines):
+            sub = lines[i].strip()
+            if sub.startswith("args:"):
+                block_end = _consume_continuation(lines, i)
+                block = lines[i:block_end]
+                args_text = _unfold(block)[len("args:") :].strip()
+                try:
+                    record["args"] = json.loads(args_text)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                i = block_end
+                continue
+            if sub.startswith("error:"):
+                block_end = _consume_continuation(lines, i)
+                block = lines[i:block_end]
+                record["error"] = _unfold(block)[len("error:") :].strip()
+                i = block_end
+                continue
+            break
+        records.append(record)
+    return records
+
+
+def derive_detailed_metrics(records: list[dict]) -> dict:
+    """Derive aggregate metrics from parsed tool-call *records*."""
+    tool_names = [r["name"] for r in records]
+    list_files_count = tool_names.count("list_files")
+    search_files_count = tool_names.count("search_files")
+    read_file_count = tool_names.count("read_file")
+    write_file_count = tool_names.count("write_file")
+    run_tests_count = tool_names.count("run_tests")
+
+    files_inspected: list[str] = []
+    for r in records:
+        if r["name"] == "read_file":
+            path = r["args"].get("path", "")
+            if path and path not in files_inspected:
+                files_inspected.append(path)
+
+    files_modified: list[str] = []
+    for r in records:
+        if r["name"] == "write_file":
+            path = r["args"].get("path", "")
+            if path and path not in files_modified:
+                files_modified.append(path)
+
+    first_rt_idx = next(
+        (i for i, n in enumerate(tool_names) if n == "run_tests"), -1
+    )
+    first_rf_idx = next(
+        (i for i, n in enumerate(tool_names) if n == "read_file"), len(tool_names)
+    )
+    run_tests_before_inspection = (
+        first_rt_idx >= 0 and first_rt_idx < first_rf_idx
+    )
+
+    first_wf_idx = next(
+        (i for i, n in enumerate(tool_names) if n == "write_file"), len(tool_names)
+    )
+    reads_before_fix = sum(
+        1 for i, n in enumerate(tool_names)
+        if n == "read_file" and i < first_wf_idx
+    )
+
+    parts: list[str] = []
+    i = 0
+    while i < len(tool_names):
+        name = tool_names[i]
+        count = 1
+        while i + count < len(tool_names) and tool_names[i + count] == name:
+            count += 1
+        label = name
+        if not records[i]["success"]:
+            label += "(fail)"
+        elif name == "run_tests" and count == 1:
+            label += "(ok)"
+        if count > 1:
+            label += f"x{count}"
+        parts.append(label)
+        i += count
+    sequence_string = "->".join(parts)
+
+    return {
+        "list_files_count": list_files_count,
+        "search_files_count": search_files_count,
+        "read_file_count": read_file_count,
+        "write_file_count": write_file_count,
+        "run_tests_count": run_tests_count,
+        "files_inspected": files_inspected,
+        "files_modified": files_modified,
+        "first_run_tests_index": first_rt_idx,
+        "run_tests_before_inspection": run_tests_before_inspection,
+        "reads_before_fix": reads_before_fix,
+        "sequence_string": sequence_string,
+    }
+
+
 # --------------------------------------------------------------- main
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -159,6 +303,14 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--churro-root", type=Path, default=None,
+        help="CHURRO source root for agent imports (default: repository root)",
+    )
+    parser.add_argument(
+        "--condition", choices=("A", "B"), default=None,
+        help="Experimental condition label recorded in meta.json",
+    )
     args = parser.parse_args()
 
     if not TASK_FILE.is_file():
@@ -182,6 +334,8 @@ def main() -> int:
         "churro_commit": CHURRO_COMMIT_HINT,
         "python": sys.version.split()[0],
         "cwd": os.getcwd(),
+        "condition": args.condition,
+        "churro_root": os.fspath(args.churro_root) if args.churro_root else None,
     }
     print(f"[bench] run dir    : {run_dir}")
     print(f"[bench] model      : {args.model}")
@@ -198,7 +352,8 @@ def main() -> int:
         print(f"[bench] WARNING: model {args.model} not listed in `ollama list`")
 
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO)
+    churro_root = args.churro_root if args.churro_root else REPO
+    env["PYTHONPATH"] = str(churro_root)
     env["CHURRO_PROVIDER"] = "ollama"
     env["CHURRO_MODEL"] = args.model
     env["CHURRO_WORKSPACE"] = os.fspath(args.workspace)
@@ -307,6 +462,17 @@ def main() -> int:
     final_check_ok = bool(run_tests_calls) and run_tests_calls[-1][1]
     meta["tool_trace"] = trace
     meta["run_tests_calls"] = run_tests_calls
+
+    detailed_records = parse_detailed_trace(log_text)
+    detailed = derive_detailed_metrics(detailed_records)
+    overview_enabled = (
+        Path(churro_root, "churro", "repo_index.py").is_file()
+        if churro_root.exists() else False
+    )
+    detailed["overview_enabled"] = overview_enabled
+    detailed["condition"] = args.condition
+    meta["detailed"] = detailed
+
     meta["results"] = {
         "pre_ok": pre_ok,
         "post_ok": post_ok,
@@ -327,12 +493,18 @@ def main() -> int:
 
     print("\n================ STEP 19 BENCHMARK RESULT ================")
     print(f"model            : {args.model}")
+    print(f"condition        : {args.condition or '(none)'}")
+    print(f"churro root      : {churro_root}")
+    print(f"overview enabled : {overview_enabled}")
     print(f"run dir          : {run_dir}")
     print(f"agent wall time  : {meta.get('elapsed_seconds', 'n/a')}s")
     print(f"pre-check        : 9 passed / 3 failed -> OK={pre_ok}")
     print(f"post-check       : {post_passed} passed / {post_failed} failed -> OK={post_ok}")
     print(f"iterations/tools : {len(trace)} tool call(s) -> {trace}")
     print(f"run_tests calls  : {run_tests_calls}")
+    print(f"sequence         : {detailed['sequence_string']}")
+    print(f"files inspected  : {detailed['files_inspected']}")
+    print(f"files modified   : {detailed['files_modified']}")
     print(f"tests unchanged  : {tests_unchanged}")
     print(f"repo unchanged   : {repo_unchanged}")
     print(f"timed out        : {timed_out}")

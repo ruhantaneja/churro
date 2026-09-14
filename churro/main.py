@@ -189,9 +189,13 @@ class CHURROApp:
         return messages
 
     def _build_system_content(self) -> str:
+        from churro.repo_index import build_summary
+
         return "\n\n".join(
             [
                 self.system_prompt,
+                "REPOSITORY OVERVIEW",
+                build_summary(PROJECT_ROOT),
                 "CURRENT PROJECT STATE",
                 format_state(self.session.state),
             ]
