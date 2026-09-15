@@ -16,7 +16,7 @@ from typing import Callable
 from rich.console import Console
 
 from churro.agent import AgentResult, AgentRunner, DEFAULT_MAX_ITERATIONS
-from churro.core.handoff import build_handoff, character_count, estimate_tokens, format_state
+from churro.core.handoff import build_handoff, character_count, estimate_tokens, format_agent_frame, format_state
 from churro.core.session import (
     AgentFrame,
     ArchivedConversation,
@@ -73,6 +73,7 @@ HELP_TEXT = """Commands:
   /save                        Save the session to disk now
   /switch <provider[:model]>   Switch provider/model (openai, ollama)
   /agent <task>                Run a bounded AgentRunner over the task
+  /resume                      Continue an interrupted agent task
   /handoff                     Show the handoff another model would receive
   /files                       Show relevant files from state
   /help                        Show this help
@@ -279,6 +280,9 @@ class CHURROApp:
         if cmd == "/agent":
             self._command_agent(arg)
             return True
+        if cmd == "/resume":
+            self._command_resume(arg)
+            return True
 
         self.console.print(f"Unknown command: {cmd}", markup=False)
         self.console.print("Type /help to list commands.", markup=False)
@@ -312,6 +316,12 @@ class CHURROApp:
             f"Turns:     {len(s.conversation_history)} active / "
             f"{len(s.archived_conversations)} archived"
         )
+        if s.pending_agent is not None:
+            lines.append(
+                f"Resume:    interrupted agent task "
+                f"('{s.pending_agent.task}', {s.pending_agent.stop_reason}) "
+                f"- use /resume"
+            )
         self.console.print("\n".join(lines), markup=False)
 
     def _command_handoff(self) -> None:
@@ -348,6 +358,39 @@ class CHURROApp:
         self.console.print(f"> Starting agent on task: {task}", markup=False)
 
         self._run_agent(task, self._build_messages())
+
+    def _command_resume(self, unused: str) -> None:
+        frame = self.session.pending_agent
+        if frame is None:
+            self.console.print("No interrupted agent task to resume.", markup=False)
+            return
+
+        task = frame.task
+        self.session.conversation_history.append(
+            ConversationMessage(role="user", content=task)
+        )
+
+        self.console.print("-- Agent --", markup=False)
+        self.console.print(f"> Continuing task: {task}", markup=False)
+
+        # Continuation gets a fresh provider conversation: the standard
+        # system pipeline (prompt + repo overview + structure + state),
+        # plus the compact interrupted-agent block. The old model's internal
+        # conversation is never replayed.
+        system_content = (
+            self._build_system_content()
+            + "\n\n"
+            + format_agent_frame(frame)
+        )
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": task},
+        ]
+        # Each resume is a fresh bounded run with the full configured
+        # iteration budget (same semantics as /agent). The updated frame
+        # records the latest attempt's consumed/max budget, so no separate
+        # budget accounting is needed.
+        self._run_agent(task, messages)
 
     def _run_agent(self, task: str, messages: list) -> None:
         runner = AgentRunner(

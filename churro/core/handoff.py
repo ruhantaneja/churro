@@ -1,6 +1,6 @@
 from math import ceil
 
-from churro.core.session import Session, SessionState
+from churro.core.session import AgentFrame, Session, SessionState
 
 CHARS_PER_TOKEN = 4
 
@@ -51,6 +51,32 @@ def build_handoff(source: Session | SessionState) -> str:
         "PROJECT STATE\n\n"
         f"{format_state(state)}\n"
         "Continue from this state. Do not repeat completed work unnecessarily."
+    )
+
+
+def format_agent_frame(frame: AgentFrame) -> str:
+    """Render an interrupted-agent frame as a compact continuation block.
+
+    Pure transformation: AgentFrame -> String. Tells a fresh model what was
+    attempted and to continue from the workspace. Never includes tool
+    outputs, file contents, provider objects, or any part of the old model's
+    conversation.
+    """
+    if frame.tool_digest:
+        tools = "\n".join(f"  {line}" for line in frame.tool_digest)
+    else:
+        tools = "  (none)"
+    return (
+        "INTERRUPTED AGENT\n"
+        f"Task: {frame.task}\n"
+        f"Previous stop reason: {frame.stop_reason}\n"
+        f"Previous iterations: {frame.iterations_used}/{frame.max_iterations}\n"
+        "Tools already executed:\n"
+        f"{tools}\n\n"
+        "Important:\n"
+        "The workspace contains the actual current state.\n"
+        "Inspect the workspace before making assumptions.\n"
+        "Continue the original task rather than restarting it."
     )
 
 

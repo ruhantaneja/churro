@@ -877,6 +877,251 @@ def test_switch_preserves_pending_agent():
     assert app.session.pending_agent.stop_reason == "provider_error"
 
 
+# ---- manual /resume (Step 3) ----
+
+
+def test_resume_with_no_pending_agent_prints_message():
+    provider = AgentFakeProvider(responses=[final_response("ignored")])
+    app, outputs = make_agent_app(new_session(), provider, ["/resume", "/quit"])
+    code, text = run(app, outputs)
+
+    assert code == 0
+    assert "No interrupted agent task to resume." in text
+    assert provider.agent_calls == []
+    assert app.session.pending_agent is None
+
+
+def test_resume_receives_fresh_continuation_context():
+    provider = SequenceProvider(
+        [
+            tool_response("ping"),
+            APIRequestError("network down"),
+            final_response("finally done"),
+        ]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent fix it", "/resume", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    assert len(provider.requests) == 3
+    resumed_messages = provider.requests[2]["messages"]
+    assert [m["role"] for m in resumed_messages] == ["system", "user"]
+    assert resumed_messages[-1]["content"] == "fix it"
+    system_content = resumed_messages[0]["content"]
+    assert "INTERRUPTED AGENT" in system_content
+    assert "Task: fix it" in system_content
+    assert "Previous stop reason: provider_error" in system_content
+    assert "Previous iterations: 2/10" in system_content
+    assert "ping(c1) -> success" in system_content
+    assert "REPOSITORY OVERVIEW" in system_content
+    assert "REPOSITORY STRUCTURE" in system_content
+    assert "CURRENT PROJECT STATE" in system_content
+    assert "SYSTEM_RULES" in system_content
+    assert "finally done" in outputs.getvalue()
+
+
+def test_resume_does_not_replay_old_conversation():
+    provider = SequenceProvider(
+        [
+            tool_response("ping"),
+            APIRequestError("down"),
+            final_response("done"),
+        ]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent fix it", "/resume", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    resumed_messages = provider.requests[2]["messages"]
+    assert len(resumed_messages) == 2
+    assert resumed_messages[0]["role"] == "system"
+    assert resumed_messages[1]["role"] == "user"
+    assert "(agent output)" not in str(resumed_messages)
+
+
+def test_resume_uses_current_provider():
+    first = SequenceProvider(
+        [tool_response("ping"), APIRequestError("down")]
+    )
+    resumed = AgentFakeProvider(
+        name="ollama", model="qwen3:14b", responses=[final_response("resumed ok")]
+    )
+    registry = {"ollama": lambda model=None: resumed}
+    app, outputs = make_agent_app(
+        new_session(), first,
+        ["/agent fix it", "/switch ollama:qwen3:14b", "/resume", "/quit"],
+        provider_registry=registry,
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    assert app.provider is resumed
+    assert app.session.active_provider == "ollama"
+    assert len(first.requests) == 2
+    assert len(resumed.agent_calls) == 1
+    assert resumed.agent_calls[0]["messages"][-1]["content"] == "fix it"
+    assert "resumed ok" in outputs.getvalue()
+
+
+def test_successful_resume_clears_pending_agent_and_saves():
+    provider = SequenceProvider(
+        [
+            tool_response("ping"),
+            APIRequestError("down"),
+            final_with_state("Done.", {"status": "done", "next_action": "ship it"}),
+        ]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent fix it", "/resume", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    assert app.session.pending_agent is None
+    loaded = load_session(str(app.session_path))
+    assert loaded.pending_agent is None
+    assert loaded.state.status == "done"
+    assert loaded.state.next_action == "ship it"
+    assert "Done." in outputs.getvalue()
+
+
+def test_resume_failure_updates_pending_agent():
+    provider = SequenceProvider(
+        [
+            tool_response("ping"),
+            APIRequestError("down"),
+            tool_response("boom"),
+            APIRequestError("offline again"),
+        ]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent fix it", "/resume", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    frame = app.session.pending_agent
+    assert frame is not None
+    assert frame.task == "fix it"
+    assert frame.stop_reason == "provider_error"
+    assert frame.iterations_used == 2
+    assert frame.tool_digest == ["boom(c1) -> failure"]
+    assert "offline again" in outputs.getvalue()
+
+
+def test_resume_interrupted_by_ctrl_c_persists_frame():
+    provider = SequenceProvider(
+        [
+            tool_response("ping"),
+            APIRequestError("down"),
+            tool_response("boom"),
+            KeyboardInterrupt(),
+        ]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent fix it", "/resume", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    frame = app.session.pending_agent
+    assert frame is not None
+    assert frame.stop_reason == "interrupted"
+    assert frame.tool_digest == ["boom(c1) -> failure"]
+    assert frame.task == "fix it"
+    loaded = load_session(str(app.session_path))
+    assert loaded.pending_agent is not None
+    assert loaded.pending_agent.stop_reason == "interrupted"
+    assert "interrupted by Ctrl+C" in outputs.getvalue()
+
+
+def test_repeated_resume_with_switch_works():
+    provider = SequenceProvider(
+        [
+            tool_response("ping"),
+            APIRequestError("down"),
+            tool_response("boom"),
+            APIRequestError("offline"),
+            final_response("recovered at last"),
+        ]
+    )
+    registry = {"ollama": lambda model=None: provider}
+    app, outputs = make_agent_app(
+        new_session(), provider,
+        [
+            "/agent fix it",
+            "/resume",
+            "/switch ollama:qwen3:14b",
+            "/resume",
+            "/quit",
+        ],
+        provider_registry=registry,
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    assert len(provider.requests) == 5
+    assert app.session.active_provider == "ollama"
+    assert app.session.pending_agent is None
+    first_resume_system = provider.requests[2]["messages"][0]["content"]
+    second_resume_system = provider.requests[4]["messages"][0]["content"]
+    assert "Task: fix it" in first_resume_system
+    assert "Previous stop reason: provider_error" in first_resume_system
+    assert "boom(c1) -> failure" in second_resume_system
+    assert "recovered at last" in outputs.getvalue()
+
+
+def test_switch_preserves_pending_and_status_shows_resume():
+    first = SequenceProvider(
+        [tool_response("ping"), APIRequestError("down")]
+    )
+    ollama_provider = AgentFakeProvider(
+        name="ollama", model="qwen3:14b", responses=[final_response("ok")]
+    )
+    registry = {"ollama": lambda model=None: ollama_provider}
+    app, outputs = make_agent_app(
+        new_session(), first,
+        ["/agent fix it", "/switch ollama:qwen3:14b", "/status", "/quit"],
+        provider_registry=registry,
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    assert app.provider is ollama_provider
+    assert app.session.pending_agent is not None
+    assert app.session.pending_agent.task == "fix it"
+    text = outputs.getvalue()
+    assert "Resume:    interrupted agent task" in text
+    assert "use /resume" in text
+
+
+def test_resume_continuation_context_is_compact_and_bounded():
+    provider = SequenceProvider(
+        [
+            tool_response("boom"),
+            APIRequestError("down"),
+            final_response("done"),
+        ]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent risky", "/resume", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    resumed_messages = provider.requests[2]["messages"]
+    system_content = resumed_messages[0]["content"]
+    assert "the fake tool exploded" not in system_content
+    assert "pong" not in system_content
+    assert "<state_update>" not in system_content
+    assert len(resumed_messages) == 2
+    assert len(system_content) < 20000
+
+
 TEST_FUNCTIONS = [
     test_agent_command_recognized_and_answered,
     test_agent_empty_task_shows_usage,
@@ -926,6 +1171,16 @@ TEST_FUNCTIONS = [
     test_tool_digest_contains_status_not_outputs,
     test_pending_agent_survives_save_and_load,
     test_switch_preserves_pending_agent,
+    test_resume_with_no_pending_agent_prints_message,
+    test_resume_receives_fresh_continuation_context,
+    test_resume_does_not_replay_old_conversation,
+    test_resume_uses_current_provider,
+    test_successful_resume_clears_pending_agent_and_saves,
+    test_resume_failure_updates_pending_agent,
+    test_resume_interrupted_by_ctrl_c_persists_frame,
+    test_repeated_resume_with_switch_works,
+    test_switch_preserves_pending_and_status_shows_resume,
+    test_resume_continuation_context_is_compact_and_bounded,
 ]
 
 
