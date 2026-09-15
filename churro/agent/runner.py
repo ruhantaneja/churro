@@ -28,15 +28,18 @@ class AgentResult(BaseModel):
     """The outcome of one bounded agent run.
 
     ``completed`` is True only when the provider produced a final response
-    with no tool calls. A run that exhausts ``max_iterations`` (or hits a
-    provider error) returns ``completed=False`` with everything observed so
-    far, so a future integration layer can decide how to handle it.
+    with no tool calls. A run that exhausts ``max_iterations``, hits a
+    provider error, or is interrupted returns ``completed=False`` with
+    everything observed so far, so a future integration layer can decide
+    how to handle it. ``interrupted`` distinguishes a Ctrl+C (or other
+    ``KeyboardInterrupt``) stop, where ``error`` stays ``None``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     final_text: str = ""
     completed: bool = False
+    interrupted: bool = False
     iterations: int = 0
     error: str | None = None
     tool_executions: list[ToolExecutionResult] = Field(default_factory=list)
@@ -92,6 +95,15 @@ class AgentRunner:
                     tools=definitions,
                     tool_results=tool_results,
                 )
+            except KeyboardInterrupt:
+                return AgentResult(
+                    completed=False,
+                    interrupted=True,
+                    iterations=iteration,
+                    tool_executions=tool_executions,
+                    tool_results=tool_results,
+                    messages=conversation,
+                )
             except ProviderError as exc:
                 return AgentResult(
                     completed=False,
@@ -125,7 +137,17 @@ class AgentRunner:
                     messages=conversation,
                 )
 
-            batch = self._executor.execute(response)
+            try:
+                batch = self._executor.execute(response)
+            except KeyboardInterrupt:
+                return AgentResult(
+                    completed=False,
+                    interrupted=True,
+                    iterations=iteration,
+                    tool_executions=tool_executions,
+                    tool_results=tool_results,
+                    messages=conversation,
+                )
             tool_executions.extend(batch.executions)
             tool_results.extend(result_messages_from_batch(batch))
             conversation.append(

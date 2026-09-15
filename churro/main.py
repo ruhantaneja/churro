@@ -18,9 +18,11 @@ from rich.console import Console
 from churro.agent import AgentResult, AgentRunner, DEFAULT_MAX_ITERATIONS
 from churro.core.handoff import build_handoff, character_count, estimate_tokens, format_state
 from churro.core.session import (
+    AgentFrame,
     ArchivedConversation,
     ConversationMessage,
     Session,
+    _DIGEST_MAX_LINES,
     create_session,
     load_session,
     save_session,
@@ -35,6 +37,7 @@ from churro.providers.factory import (
 )
 from churro.providers.provider import Provider, ProviderError, MissingAPIKeyError
 from churro.tools import ToolRegistry, default_tool_registry
+from churro.tools.executor import ToolExecutionResult
 
 CHURRO_WORKSPACE_ENV = "CHURRO_WORKSPACE"
 
@@ -74,6 +77,40 @@ HELP_TEXT = """Commands:
   /files                       Show relevant files from state
   /help                        Show this help
   /quit                        Save and exit"""
+
+
+def _tool_digest_from_executions(
+    executions: list[ToolExecutionResult],
+) -> list[str]:
+    """Compact one-line digest of every executed tool in an interrupted run.
+
+    Format: ``tool_name(call_id) -> success|failure``. Tool outputs and
+    arguments are deliberately excluded -- the workspace is the source of
+    truth for what was actually changed. Bounded to AgentFrame's digest
+    limits so a frame can always be built.
+    """
+    lines = [
+        f"{execution.tool_name}({execution.call_id}) -> "
+        f"{'success' if execution.result.success else 'failure'}"
+        for execution in executions
+    ]
+    return lines[:_DIGEST_MAX_LINES]
+
+
+def _build_agent_frame(
+    task: str,
+    result: AgentResult,
+    stop_reason: str,
+    max_iterations: int,
+) -> AgentFrame:
+    """Capture compact continuation metadata for a non-completed run."""
+    return AgentFrame(
+        task=task,
+        iterations_used=result.iterations,
+        max_iterations=max_iterations,
+        stop_reason=stop_reason,
+        tool_digest=_tool_digest_from_executions(result.tool_executions),
+    )
 
 
 class CHURROApp:
@@ -310,6 +347,9 @@ class CHURROApp:
         self.console.print("-- Agent --", markup=False)
         self.console.print(f"> Starting agent on task: {task}", markup=False)
 
+        self._run_agent(task, self._build_messages())
+
+    def _run_agent(self, task: str, messages: list) -> None:
         runner = AgentRunner(
             provider=self.provider,
             registry=self.tool_registry,
@@ -317,7 +357,7 @@ class CHURROApp:
         )
         try:
             with self.console.status(AGENT_STATUS_MESSAGE, spinner="dots"):
-                result: AgentResult = runner.run(self._build_messages())
+                result: AgentResult = runner.run(messages)
         except KeyboardInterrupt:
             self.console.print("> Agent interrupted by Ctrl+C.", markup=False)
             self._save()
@@ -355,11 +395,13 @@ class CHURROApp:
             processed = process_ai_response(self.session, raw_final)
             clean_answer = processed.clean_response
         else:
-            self.session.conversation_history.append(
-                ConversationMessage(role="assistant", content="(agent output)")
-            )
+            if not result.interrupted:
+                self.session.conversation_history.append(
+                    ConversationMessage(role="assistant", content="(agent output)")
+                )
 
         if result.completed:
+            self.session.pending_agent = None
             if not clean_answer:
                 self.console.print(
                     "> Agent finished with no text response.", markup=False
@@ -368,12 +410,23 @@ class CHURROApp:
                 self.console.print(">", markup=False)
                 self.console.print(clean_answer, markup=False)
         else:
-            reason = result.error or (
-                f"iteration limit reached after {result.iterations} iterations"
-            )
-            self.console.print(f"> Agent stopped: {reason}", markup=False)
+            if result.interrupted:
+                self.console.print("> Agent interrupted by Ctrl+C.", markup=False)
+                stop_reason = "interrupted"
+            else:
+                stop_reason = "provider_error" if result.error else "iteration_limit"
+                reason = result.error or (
+                    f"iteration limit reached after {result.iterations} iterations"
+                )
+                self.console.print(f"> Agent stopped: {reason}", markup=False)
             if clean_answer:
                 self.console.print(clean_answer, markup=False)
+            self.session.pending_agent = _build_agent_frame(
+                task=task,
+                result=result,
+                stop_reason=stop_reason,
+                max_iterations=self.agent_max_iterations,
+            )
 
         if processed is not None:
             for warning in processed.warnings:

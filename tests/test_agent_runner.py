@@ -261,6 +261,35 @@ def test_provider_failure_after_some_tool_runs():
     assert len(result.tool_executions) == 1
 
 
+def test_keyboard_interrupt_returns_partial_result():
+    runner, _ = make_runner(
+        [
+            ProviderResponse(tool_calls=[tool("c1", "adder", {"a": 1, "b": 1})],
+                             finish_reason="tool_calls"),
+            KeyboardInterrupt(),
+        ]
+    )
+    result = runner.run(MESSAGES)
+    assert result.completed is False
+    assert result.interrupted is True
+    assert result.error is None
+    assert result.iterations == 2
+    assert len(result.tool_executions) == 1
+    assert result.tool_executions[0].call_id == "c1"
+    assert len(result.tool_results) == 1
+
+
+def test_keyboard_interrupt_before_any_tool_keeps_empty_accumulation():
+    runner, _ = make_runner([KeyboardInterrupt()])
+    result = runner.run(MESSAGES)
+    assert result.completed is False
+    assert result.interrupted is True
+    assert result.error is None
+    assert result.iterations == 1
+    assert result.tool_executions == []
+    assert result.tool_results == []
+
+
 def test_empty_final_response():
     runner, _ = make_runner([final("")])
     result = runner.run(MESSAGES)
@@ -557,6 +586,8 @@ TEST_FUNCTIONS = [
     test_invalid_max_iterations_raise,
     test_provider_failure_is_surfaced,
     test_provider_failure_after_some_tool_runs,
+    test_keyboard_interrupt_returns_partial_result,
+    test_keyboard_interrupt_before_any_tool_keeps_empty_accumulation,
     test_empty_final_response,
     test_empty_tool_result_fed_back,
     test_result_ordering_preserved,

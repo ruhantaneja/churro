@@ -99,6 +99,31 @@ def final_with_state(text, update):
     return ProviderResponse(text=text + "\n" + block, finish_reason="stop")
 
 
+class SequenceProvider(Provider):
+    """Pops canned items; exception instances are raised when reached.
+
+    Lets a test script an interrupted run: a tool call first, then a
+    ``KeyboardInterrupt`` or a ``ProviderError`` on the next iteration.
+    """
+
+    name = "openai"
+
+    def __init__(self, responses, model="gpt-4o"):
+        self.model = model
+        self.responses = list(responses)
+        self.requests = []
+
+    def send(self, messages):
+        return "unused"
+
+    def send_normalized(self, messages, tools=None, tool_results=None):
+        self.requests.append({"messages": messages})
+        item = self.responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
 def default_registry():
     registry = ToolRegistry()
     registry.register(PingTool())
@@ -715,6 +740,143 @@ def test_agent_tool_transcript_not_dumped_to_state():
     assert len(session.conversation_history) == 2
 
 
+# ---- interrupted-run AgentFrame capture (Step 2) ----
+
+
+def test_successful_agent_leaves_pending_agent_none():
+    provider = AgentFakeProvider(responses=[final_response("All set.")])
+    app, outputs = make_agent_app(new_session(), provider, ["/agent tidy", "/quit"])
+    run(app, outputs)
+
+    assert app.session.pending_agent is None
+    assert "All set." in outputs.getvalue()
+
+
+def test_provider_failure_creates_pending_agent():
+    provider = AgentFakeProvider(error=APIRequestError("down"))
+    app, outputs = make_agent_app(new_session(), provider, ["/agent risky", "/quit"])
+    run(app, outputs)
+
+    frame = app.session.pending_agent
+    assert frame is not None
+    assert frame.task == "risky"
+    assert frame.stop_reason == "provider_error"
+    assert frame.iterations_used == 1
+    assert frame.max_iterations == DEFAULT_MAX_ITERATIONS
+    assert frame.tool_digest == []
+
+
+def test_provider_failure_records_task_iterations_and_digest():
+    provider = SequenceProvider(
+        [tool_response("ping"), APIRequestError("network down")]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent fix it", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    frame = app.session.pending_agent
+    assert frame is not None
+    assert frame.task == "fix it"
+    assert frame.stop_reason == "provider_error"
+    assert frame.iterations_used == 2
+    assert frame.max_iterations == DEFAULT_MAX_ITERATIONS
+    assert frame.tool_digest == ["ping(c1) -> success"]
+
+
+def test_iteration_limit_creates_pending_agent():
+    provider = AgentFakeProvider(responses=[tool_response("ping")], repeat_last=True)
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent loop", "/quit"],
+        tool_registry=default_registry(),
+        agent_max_iterations=3,
+    )
+    run(app, outputs)
+
+    frame = app.session.pending_agent
+    assert frame is not None
+    assert frame.stop_reason == "iteration_limit"
+    assert frame.iterations_used == 3
+    assert frame.max_iterations == 3
+    assert frame.tool_digest == ["ping(c1) -> success"] * 3
+
+
+def test_ctrl_c_preserves_partial_agent_frame():
+    provider = SequenceProvider([tool_response("ping"), KeyboardInterrupt()])
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent do it", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    frame = app.session.pending_agent
+    assert frame is not None
+    assert frame.stop_reason == "interrupted"
+    assert frame.iterations_used == 2
+    assert frame.tool_digest == ["ping(c1) -> success"]
+    assert "interrupted by Ctrl+C" in outputs.getvalue()
+    assert frame.completed_at is not None
+
+
+def test_tool_digest_contains_status_not_outputs():
+    provider = SequenceProvider(
+        [tool_response("boom"), APIRequestError("down")]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent risky", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    frame = app.session.pending_agent
+    assert frame.tool_digest == ["boom(c1) -> failure"]
+    rendered = "\n".join(frame.tool_digest)
+    assert "exploded" not in rendered
+    assert "pong" not in rendered
+    assert "output" not in frame.model_dump()
+
+
+def test_pending_agent_survives_save_and_load():
+    provider = SequenceProvider(
+        [tool_response("ping"), APIRequestError("down")]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider, ["/agent fix it", "/quit"],
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    loaded = load_session(str(app.session_path))
+    assert loaded.pending_agent is not None
+    assert loaded.pending_agent == app.session.pending_agent
+    assert loaded.pending_agent.stop_reason == "provider_error"
+    assert loaded.pending_agent.task == "fix it"
+
+
+def test_switch_preserves_pending_agent():
+    ollama_provider = AgentFakeProvider(
+        name="ollama", model="qwen3:14b", responses=[final_response("ok")]
+    )
+    registry = {"ollama": lambda model=None: ollama_provider}
+    provider = SequenceProvider(
+        [tool_response("ping"), APIRequestError("down")]
+    )
+    app, outputs = make_agent_app(
+        new_session(), provider,
+        ["/agent fix it", "/switch ollama:qwen3:14b", "/quit"],
+        provider_registry=registry,
+        tool_registry=default_registry(),
+    )
+    run(app, outputs)
+
+    assert app.provider is ollama_provider
+    assert app.session.active_model == "qwen3:14b"
+    assert len(app.session.archived_conversations) == 1
+    assert app.session.pending_agent is not None
+    assert app.session.pending_agent.stop_reason == "provider_error"
+
+
 TEST_FUNCTIONS = [
     test_agent_command_recognized_and_answered,
     test_agent_empty_task_shows_usage,
@@ -756,6 +918,14 @@ TEST_FUNCTIONS = [
     test_agent_invalid_state_update_does_not_corrupt_state,
     test_agent_state_update_block_not_leaked_into_answer,
     test_agent_tool_transcript_not_dumped_to_state,
+    test_successful_agent_leaves_pending_agent_none,
+    test_provider_failure_creates_pending_agent,
+    test_provider_failure_records_task_iterations_and_digest,
+    test_iteration_limit_creates_pending_agent,
+    test_ctrl_c_preserves_partial_agent_frame,
+    test_tool_digest_contains_status_not_outputs,
+    test_pending_agent_survives_save_and_load,
+    test_switch_preserves_pending_agent,
 ]
 
 
